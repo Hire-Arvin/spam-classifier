@@ -1,0 +1,459 @@
+---
+title: "Email Spam Classifier"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    toc-title: "Contents"
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+    smooth-scroll: true
+    highlight-style: github
+    fig-align: center
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+This project builds a binary email spam classifier using the
+[SpamAssassin public corpus](https://spamassassin.apache.org/old/publiccorpus/),
+a dataset of 8,348 labeled emails collected in the early 2000s (0 = legitimate, 1 = spam).
+The analysis follows a two-stage arc: first, a simple baseline model built from
+word-indicator features; then an improved model with hand-engineered structural
+features, cross-validated and evaluated in full.
+
+---
+
+## 1. Setup
+
+```{python}
+import numpy as np
+import pandas as pd
+import zipfile
+import warnings
+warnings.filterwarnings('ignore')
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_curve, confusion_matrix
+
+from utils import *
+
+plt.rcParams['figure.figsize'] = (10, 6)
+sns.set(style='whitegrid', color_codes=True, font_scale=1.3)
+```
+
+---
+
+## 2. Data Loading & Overview
+
+The dataset ships as a zip archive containing a labeled training set and an
+unlabeled test set. Six emails in the training set have missing subjects, filled
+with empty strings below.
+
+```{python}
+with zipfile.ZipFile('data/spam_ham_data.zip') as z:
+    with z.open('train.csv') as f:
+        original_data = pd.read_csv(f)
+    with z.open('test.csv') as f:
+        test_data = pd.read_csv(f)
+
+original_data = original_data.fillna('')
+test_data = test_data.fillna('')
+
+print(f'Training set: {original_data.shape[0]:,} emails, {original_data["spam"].mean():.1%} spam')
+original_data.head()
+```
+
+The dataset is split 90/10 into training and validation sets. The random seed is
+fixed at 42 throughout.
+
+```{python}
+train, val = train_test_split(original_data, test_size=0.1, random_state=42)
+train = train.reset_index(drop=True)
+val   = val.reset_index(drop=True)
+print(f'Train: {len(train):,}  |  Val: {len(val):,}')
+```
+
+---
+
+## 3. Exploratory Data Analysis
+
+### 3.1 Spam vs. Legitimate Email at a Glance
+
+**Comparing the first legitimate and first spam email in the dataset reveals an
+immediate structural difference.** The legitimate email reads like a plain-text news
+digest — normal prose, readable URLs, no markup. The spam email is pure HTML:
+inline font tags, obfuscated character escapes (e.g., `3d"` for `="`), and a
+suspicious IP-address link with no domain name. This suggests that structural
+signals — the presence of HTML, suspicious formatting — may be as informative
+as the words themselves.
+
+```{python}
+first_ham  = original_data.loc[original_data['spam'] == 0, 'email'].iloc[0]
+first_spam = original_data.loc[original_data['spam'] == 1, 'email'].iloc[0]
+
+print('=== LEGITIMATE EMAIL (first 600 chars) ===')
+print(first_ham[:600])
+print('\n=== SPAM EMAIL (first 600 chars) ===')
+print(first_spam[:600])
+```
+
+### 3.2 Word Frequency by Class
+
+**Certain words appear far more often in spam than in legitimate emails.** The bar chart below
+compares, for each word, the proportion of spam emails that contain it versus
+the proportion of legitimate emails. Words like "free", "click", and "offer" are strong
+spam signals, while "urgent" and "dollar" appear slightly more in spam but are
+less reliable on their own.
+
+```{python}
+#| fig-cap: "Proportion of emails containing each word, broken down by class."
+
+words_to_check = ['free', 'click', 'winner', 'offer', 'dollar', 'urgent']
+train_lower = train.copy()
+train_lower['email'] = train_lower['email'].str.lower()
+
+word_array = words_in_texts(words_to_check, train_lower['email'])
+word_df = pd.DataFrame(word_array, columns=words_to_check)
+word_df['type'] = train['spam'].map({0: 'Legitimate', 1: 'Spam'})
+
+grouped = word_df.melt(id_vars='type').groupby(['type', 'variable'])['value'].mean().reset_index()
+
+sns.barplot(data=grouped, x='variable', y='value', hue='type')
+plt.title('Word Presence Rate by Email Class')
+plt.xlabel('Word')
+plt.ylabel('Proportion of Emails Containing Word')
+plt.legend(title='Class')
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 4. Feature Engineering
+
+### 4.1 Word Indicator Features
+
+The `words_in_texts` utility (in `utils.py`) converts a list of words and a
+Series of email strings into a binary matrix: 1 if a word appears in an email,
+0 otherwise. This is the building block for both the baseline model and the
+EDA heatmap.
+
+```{python}
+# Demonstrate words_in_texts
+demo = words_in_texts(['hello', 'world'], pd.Series(['hello there', 'hello world', 'goodbye']))
+pd.DataFrame(demo, columns=['hello', 'world'])
+```
+
+### 4.2 Structural & Lexical Features
+
+**Word presence alone misses a lot of signal.** A richer set of features was
+designed to capture structural properties of emails that correlate with spam:
+
+| Feature | Description |
+|---|---|
+| `has_html` | 1 if the email body contains any HTML tag (`<html>`, `<a>`, `<img>`, `<div>`) |
+| `perc_capitals` | Fraction of characters in the email that are uppercase |
+| `is_reply` | 1 if the subject line starts with "Subject: Re:" |
+| `click`, `money`, `free`, `offer` | Word count of each term in the email body |
+| `num_exclamations` | Total count of `!` characters |
+
+```{python}
+train_feat = extract_features(train)
+val_feat   = extract_features(val)
+
+selected_features = [
+    'has_html', 'perc_capitals', 'is_reply',
+    'click', 'money', 'free', 'offer', 'num_exclamations'
+]
+
+train_feat[selected_features + ['spam']].head()
+```
+
+### 4.3 Feature Correlation Heatmap
+
+**The heatmap below guided feature selection** by showing which engineered
+variables are most correlated with the spam label. `has_html` and `perc_capitals`
+show the strongest positive correlations with spam, while `is_reply` is
+negatively correlated — replies are almost always legitimate conversations.
+Keyword counts like `free` and `offer` are moderately correlated, and meaningful
+even if individually weak, since they combine in the logistic model.
+
+```{python}
+#| fig-cap: "Pairwise Pearson correlations across all engineered features and the spam label."
+
+all_features = selected_features + ['spam']
+
+# Compute features on full training set for a stable heatmap
+full_feat = extract_features(train)
+
+corr = full_feat[all_features].corr()
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm', linewidths=0.4)
+plt.title('Feature Correlation Matrix')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 5. Baseline Model
+
+### 5.1 Five-Word Logistic Regression
+
+The simplest possible classifier uses five words — "drug", "bank",
+"prescription", "memo", and "private" — as binary features fed directly into
+logistic regression.
+
+```{python}
+five_words = ['drug', 'bank', 'prescription', 'memo', 'private']
+train_lower = train.copy()
+train_lower['email'] = train_lower['email'].str.lower()
+
+X_baseline = words_in_texts(five_words, train_lower['email'])
+y_train_base = train['spam'].values
+
+baseline_model = LogisticRegression()
+baseline_model.fit(X_baseline, y_train_base)
+
+baseline_train_acc = baseline_model.score(X_baseline, y_train_base)
+print(f'Baseline training accuracy: {baseline_train_acc:.3f}')
+```
+
+### 5.2 The Zero Predictor Benchmark
+
+**A critical sanity check for any classifier is comparison against the "zero
+predictor"** — a trivial model that always predicts legitimate. Because ~74% of emails
+are legitimate, the zero predictor achieves 74% accuracy while detecting exactly zero
+spam. Any useful filter must beat this benchmark not just on accuracy, but on
+recall.
+
+```{python}
+zero_acc = 1 - y_train_base.mean()
+print(f'Zero predictor accuracy: {zero_acc:.3f}  (recall = 0.000)')
+print(f'Baseline accuracy:       {baseline_train_acc:.3f}')
+```
+
+### 5.3 Precision, Recall, and False Positive Rate
+
+```{python}
+y_pred_base = baseline_model.predict(X_baseline)
+
+TP = np.sum((y_pred_base == 1) & (y_train_base == 1))
+TN = np.sum((y_pred_base == 0) & (y_train_base == 0))
+FP = np.sum((y_pred_base == 1) & (y_train_base == 0))
+FN = np.sum((y_pred_base == 0) & (y_train_base == 1))
+
+precision = TP / (TP + FP)
+recall    = TP / (TP + FN)
+fpr       = FP / (FP + TN)
+
+print(f'Precision:          {precision:.3f}')
+print(f'Recall:             {recall:.3f}')
+print(f'False positive rate:{fpr:.3f}')
+print(f'\nTP={TP}, TN={TN}, FP={FP}, FN={FN}')
+```
+
+::: {.callout-warning}
+**The baseline model catches very little spam.** With a recall well below 50%,
+more than half of spam emails land in the inbox undetected. The five chosen
+words ("drug", "bank", etc.) appear in too few emails to provide meaningful
+signal — most feature rows are all zeros. The model's modest accuracy edge
+over the zero predictor comes almost entirely from correctly labeling legitimate emails, not
+from detecting spam.
+:::
+
+---
+
+## 6. Improved Model
+
+### 6.1 Training
+
+The improved model uses the eight structural and lexical features from Section 4.
+Features that showed at least moderate correlation with spam in the heatmap were
+retained; weaker candidates (email length, forward indicator, digit count) were
+dropped to avoid noise.
+
+```{python}
+X_train = train_feat[selected_features].to_numpy()
+y_train = train['spam'].to_numpy()
+X_val   = val_feat[selected_features].to_numpy()
+y_val   = val['spam'].to_numpy()
+
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train, y_train)
+
+train_acc = model.score(X_train, y_train)
+val_acc   = model.score(X_val,   y_val)
+print(f'Training accuracy:   {train_acc:.3f}')
+print(f'Validation accuracy: {val_acc:.3f}')
+```
+
+### 6.2 Cross-Validation
+
+Ten-fold cross-validation confirms that the validation accuracy generalises —
+the mean CV score closely matches the held-out validation result, and the
+standard deviation is small, indicating stable performance across folds.
+
+```{python}
+cv_scores = compute_CV_error(X_train, y_train, folds=10)
+print(f'CV accuracy: {np.mean(cv_scores):.3f} ± {np.std(cv_scores):.3f}')
+print(f'Fold scores: {[round(s, 3) for s in cv_scores]}')
+```
+
+### 6.3 Confusion Matrix
+
+```{python}
+#| fig-cap: "Confusion matrix on the held-out validation set."
+
+y_val_pred = model.predict(X_val)
+cm = confusion_matrix(y_val, y_val_pred)
+
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Predicted Legitimate', 'Predicted Spam'],
+            yticklabels=['Actual Legitimate',    'Actual Spam'])
+plt.title('Validation Set Confusion Matrix')
+plt.tight_layout()
+plt.show()
+
+val_precision = cm[1,1] / (cm[0,1] + cm[1,1])
+val_recall    = cm[1,1] / (cm[1,0] + cm[1,1])
+val_fpr       = cm[0,1] / (cm[0,0] + cm[0,1])
+print(f'Validation precision: {val_precision:.3f}')
+print(f'Validation recall:    {val_recall:.3f}')
+print(f'Validation FPR:       {val_fpr:.3f}')
+```
+
+::: {.callout-note}
+**Compared to the baseline**, the improved model achieves substantially higher
+recall — it catches the majority of spam while keeping the false positive rate
+low enough to be practical as an inbox filter.
+:::
+
+---
+
+## 7. Model Analysis
+
+### 7.1 ROC Curve
+
+The ROC curve sweeps the classification threshold from 0 to 1, tracing the
+trade-off between catching more spam (higher recall) and mislabelling more legitimate emails
+(higher FPR). An area under the curve well above the diagonal indicates a
+model that generalises meaningfully beyond random chance.
+
+```{python}
+#| fig-cap: "ROC curve on the training set. The diagonal dashed line represents random guessing."
+
+train_probs = model.predict_proba(X_train)[:, 1]
+fpr_curve, tpr_curve, _ = roc_curve(y_train, train_probs)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_curve, tpr_curve, label='Logistic Regression')
+plt.plot([0, 1], [0, 1], 'k--', label='Random')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate (Recall)')
+plt.title('ROC Curve — Email Spam Classifier')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+### 7.2 Feature Coefficients
+
+**Logistic regression is interpretable by design** — each coefficient tells us
+the direction and magnitude of a feature's influence on the log-odds of spam.
+`has_html` carries the largest positive weight, confirming that HTML-formatted
+emails are a strong spam signal. `is_reply` has a strong negative coefficient,
+reflecting that reply threads are almost never spam. Keyword counts for "free",
+"click", and "offer" all push toward spam, consistent with the EDA.
+
+```{python}
+#| fig-cap: "Model coefficients for each feature. Positive values push toward spam, negative toward legitimate."
+
+coef_df = pd.DataFrame({
+    'Feature':     selected_features,
+    'Coefficient': model.coef_[0]
+}).sort_values('Coefficient')
+
+colors = ['#d73027' if c > 0 else '#4575b4' for c in coef_df['Coefficient']]
+
+plt.figure(figsize=(8, 5))
+plt.barh(coef_df['Feature'], coef_df['Coefficient'], color=colors)
+plt.axvline(0, color='black', linewidth=0.7)
+plt.xlabel('Logistic Regression Coefficient')
+plt.title('Feature Influence on Spam Probability')
+plt.tight_layout()
+plt.show()
+```
+
+### 7.3 Feature Ablation
+
+**Removing a single feature can flip an email's predicted class**, illustrating
+how sensitive a small model is to each individual signal. In a 1,000-feature
+model, removing any one feature would rarely change a prediction — each feature
+contributes a fraction of a percent. That interpretability trade-off becomes
+important when you need to explain or audit a decision.
+
+```{python}
+some_words = ['drug', 'bank', 'prescription', 'memo', 'private']
+train_lower_ab = train.copy()
+train_lower_ab['email'] = train_lower_ab['email'].str.lower()
+X_ab = words_in_texts(some_words, train_lower_ab['email'])
+y_ab = train['spam'].values
+
+ab_model = LogisticRegression()
+ab_model.fit(X_ab, y_ab)
+
+# Find a spam email with 3+ features present
+idx = next(i for i in range(len(X_ab)) if X_ab[i].sum() >= 3 and y_ab[i] == 1)
+feature_to_remove = some_words[np.argmax(X_ab[idx])]
+
+changed_words = [w for w in some_words if w != feature_to_remove]
+X_changed = words_in_texts(changed_words, train_lower_ab['email'])
+changed_model = LogisticRegression()
+changed_model.fit(X_changed, y_ab)
+
+orig_prob    = ab_model.predict_proba(X_ab[[idx]])[:, 1][0]
+changed_prob = changed_model.predict_proba(X_changed[[idx]])[:, 1][0]
+
+print(f'Email index: {idx}')
+print(f'Feature removed: "{feature_to_remove}"')
+print(f'Before: {orig_prob:.1%} spam  →  classified as {"spam" if orig_prob >= 0.5 else "legitimate"}')
+print(f'After:  {changed_prob:.1%} spam  →  classified as {"spam" if changed_prob >= 0.5 else "legitimate"}')
+```
+
+---
+
+## 8. Ethical Considerations
+
+::: {.callout-important}
+**Key takeaways from working with real-world email data:**
+
+- **Ground truth is not always clear-cut.** Some emails in this dataset are
+  genuinely ambiguous — a newsletter from a known sender, or a promotional
+  email the recipient actually signed up for. Mislabeled training examples
+  introduce irreducible noise that no model tuning can fix.
+
+- **False positives have real costs.** A spam filter that flags too many
+  legitimate emails erodes user trust and can cause important messages to
+  disappear silently. In higher-stakes settings (e.g., content moderation
+  on social platforms), incorrectly removing a post can disenfranchise users
+  and invite regulatory scrutiny.
+
+- **Interpretability matters for accountability.** A model with 8 features can
+  be audited: a user or moderator can see exactly *why* an email was flagged.
+  At 1,000 features, that explanation becomes practically impossible without
+  additional tooling. When automated decisions affect people, interpretability
+  is not a nice-to-have — it is a design requirement.
+:::
